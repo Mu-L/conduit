@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, error::Error as _, iter::FromIterator, str};
+use std::{
+    collections::BTreeMap,
+    error::Error as _,
+    iter::FromIterator,
+    net::IpAddr,
+    str::{self, FromStr},
+};
 
 use axum::{
     body::Body,
@@ -24,7 +30,10 @@ use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use super::{Ruma, RumaResponse};
-use crate::{service::appservice::RegistrationInfo, services, Error, Result};
+use crate::{
+    service::{appservice::RegistrationInfo, rate_limiting::Target},
+    services, Error, Result,
+};
 
 enum Token {
     Appservice(Box<RegistrationInfo>),
@@ -327,6 +336,23 @@ where
                 }
             };
 
+        let sender_ip_address = parts
+            .headers
+            .get("X-Forwarded-For")
+            .and_then(|header| header.to_str().ok())
+            .map(|header| header.split_once(',').map(|(ip, _)| ip).unwrap_or(header))
+            .and_then(|ip| IpAddr::from_str(ip).ok());
+
+        let target = if let Some(server_name) = sender_servername.clone() {
+            Some(Target::Server(server_name))
+        } else if let Some(user) = &sender_user {
+            Some(Target::from_client_request(appservice_info.clone(), user))
+        } else {
+            sender_ip_address.map(Target::Ip)
+        };
+
+        services().rate_limiting.check(target, metadata).await?;
+
         let mut http_request = Request::builder().uri(parts.uri).method(parts.method);
         *http_request.headers_mut().unwrap() = parts.headers;
 
@@ -377,6 +403,7 @@ where
             sender_servername,
             appservice_info,
             json_body,
+            sender_ip_address,
         })
     }
 }
